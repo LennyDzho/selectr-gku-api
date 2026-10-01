@@ -8,7 +8,7 @@ import tempfile
 from zipfile import BadZipFile
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, time
 from pathlib import Path
 from typing import Callable, Iterable, Sequence
 
@@ -30,16 +30,24 @@ INPUT_DIRECTORY = APPLICATION_DIRECTORY / "input"
 OUTPUT_FILE = APPLICATION_DIRECTORY / "output" / "output.xlsx"
 
 CREATED_AT = "Дата создания"
+VISIT_START = "Дата начала"
 LOGIN = "Логин"
 ROUTE = "Номер маршрута"
 BOARD = "Бортовой номер"
 TICKET_ID = "Уникальный номер билета"
 TICKET_TYPE = "Название типа билета"
 
-REQUIRED_HEADERS = (CREATED_AT, LOGIN, ROUTE, BOARD, TICKET_ID, TICKET_TYPE)
+REQUIRED_HEADERS = (
+    CREATED_AT,
+    VISIT_START,
+    LOGIN,
+    ROUTE,
+    BOARD,
+    TICKET_ID,
+    TICKET_TYPE,
+)
 OUTPUT_HEADERS = (
     "Дата",
-    "Время начала проверки ТС",
     LOGIN,
     ROUTE,
     BOARD,
@@ -49,8 +57,6 @@ OUTPUT_HEADERS = (
 
 ZERO_TICKET_ID = "00000000000000000000"
 SOCIAL_CARD_TYPE = "социальная карта москвича"
-SESSION_GAP = timedelta(minutes=10)
-DUPLICATE_GAP = timedelta(seconds=1)
 
 
 class ReportError(Exception):
@@ -72,6 +78,7 @@ class Record:
     route: str
     board: str
     ticket_id: str
+    visit_start: datetime
     ticket_type: str = ""
     source_name: str = ""
     source_row: int = 0
@@ -86,6 +93,17 @@ class Visit:
     check_count: int
     visit_number: int
     visit_total: int
+
+
+@dataclass(frozen=True, slots=True)
+class DailyReportRow:
+    day: date
+    login: str
+    route: str
+    board: str
+    check_count: int
+    vehicle_check_count: int
+
 
 @dataclass(frozen=True, slots=True)
 class ProcessingSummary:
@@ -153,7 +171,7 @@ def _parse_timestamp(cell: Cell, workbook_epoch: datetime) -> datetime:
     elif isinstance(value, str):
         text_value = value.strip()
         if not text_value:
-            raise ValueError("пустая дата создания")
+            raise ValueError("пустая дата")
 
         normalised = text_value.replace(",", ".")
         try:
@@ -164,7 +182,7 @@ def _parse_timestamp(cell: Cell, workbook_epoch: datetime) -> datetime:
         raise ValueError(f"неподдерживаемое значение даты: {value!r}")
 
     if parsed.tzinfo is not None:
-        raise ValueError("дата создания с часовым поясом не поддерживается")
+        raise ValueError("дата с часовым поясом не поддерживается")
     return parsed
 
 
@@ -180,7 +198,7 @@ def _parse_timestamp_with_known_formats(value: str) -> datetime:
             return datetime.strptime(value, timestamp_format)
         except ValueError:
             continue
-    raise ValueError(f"не удалось распознать дату создания {value!r}")
+    raise ValueError(f"не удалось распознать дату {value!r}")
 
 
 def read_records(
@@ -233,7 +251,13 @@ def read_records(
                 timestamp = _parse_timestamp(cells[CREATED_AT], workbook.epoch)
             except (TypeError, ValueError) as error:
                 timestamp = None
-                errors.append(str(error))
+                errors.append(f"«{CREATED_AT}»: {error}")
+
+            try:
+                visit_start = _parse_timestamp(cells[VISIT_START], workbook.epoch)
+            except (TypeError, ValueError) as error:
+                visit_start = None
+                errors.append(f"«{VISIT_START}»: {error}")
 
             login = _cell_to_text(cells[LOGIN])
             route = _cell_to_text(cells[ROUTE])
@@ -258,6 +282,7 @@ def read_records(
                 continue
 
             assert timestamp is not None
+            assert visit_start is not None
             records.append(
                 Record(
                     timestamp=timestamp,
@@ -265,6 +290,7 @@ def read_records(
                     route=route,
                     board=board,
                     ticket_id=ticket_id,
+                    visit_start=visit_start,
                     ticket_type=ticket_type,
                     source_name=workbook_path.name,
                     source_row=row_number,
@@ -281,10 +307,9 @@ def count_passenger_checks(records: Sequence[Record]) -> int:
     if not records:
         return 0
 
-    # A non-zero identifier is counted independently from every other
-    # identifier. Repeated rows for that identifier are one transaction only
-    # while consecutive timestamps differ by no more than one second.
-    ticket_times: dict[str, list[datetime]] = defaultdict(list)
+    # Every non-zero identifier is counted once for this source vehicle visit,
+    # regardless of the timestamps or products of its repeated rows.
+    ticket_ids: set[str] = set()
     social_card_seconds: set[datetime] = set()
     zero_ticket_seconds: list[datetime] = []
 
@@ -294,63 +319,35 @@ def count_passenger_checks(records: Sequence[Record]) -> int:
             zero_ticket_seconds.append(second)
             continue
 
-        ticket_times[record.ticket_id].append(record.timestamp)
+        ticket_ids.add(record.ticket_id)
         if " ".join(record.ticket_type.split()).casefold() == SOCIAL_CARD_TYPE:
             social_card_seconds.add(second)
 
     # Zero identifiers normally represent separate transactions. They are
     # artifacts of a social-card scan only when a non-zero social-card record
     # exists on the same vehicle in the same second.
-    check_count = sum(
+    return len(ticket_ids) + sum(
         second not in social_card_seconds for second in zero_ticket_seconds
     )
 
-    for timestamps in ticket_times.values():
-        timestamps.sort()
-        check_count += 1
-        for previous, current in zip(timestamps, timestamps[1:]):
-            if current - previous > DUPLICATE_GAP:
-                check_count += 1
-
-    return check_count
-
 
 def build_visits(records: Iterable[Record]) -> list[Visit]:
-    """Group records into daily inspector/route/board vehicle visits."""
-    groups: dict[tuple[date, str, str, str], list[Record]] = defaultdict(list)
+    """Group vehicle visits by their source start, inspector, route, and board."""
+    groups: dict[
+        tuple[date, str, str, str], dict[datetime, list[Record]]
+    ] = defaultdict(lambda: defaultdict(list))
     for record in records:
-        key = (record.timestamp.date(), record.login, record.route, record.board)
-        groups[key].append(record)
+        key = (record.visit_start.date(), record.login, record.route, record.board)
+        groups[key][record.visit_start].append(record)
 
     visits: list[Visit] = []
-    for (_day, login, route, board), group_records in groups.items():
-        ordered_records = sorted(
-            group_records,
-            key=lambda item: (
-                item.timestamp,
-                item.source_name.casefold(),
-                item.source_row,
-            ),
-        )
-
-        sessions: list[list[Record]] = []
-        current_session: list[Record] = []
-        for record in ordered_records:
-            if (
-                current_session
-                and record.timestamp - current_session[-1].timestamp >= SESSION_GAP
-            ):
-                sessions.append(current_session)
-                current_session = []
-            current_session.append(record)
-        if current_session:
-            sessions.append(current_session)
-
+    for (_day, login, route, board), starts in groups.items():
+        sessions = sorted(starts.items())
         visit_total = len(sessions)
-        for visit_number, session in enumerate(sessions, start=1):
+        for visit_number, (visit_start, session) in enumerate(sessions, start=1):
             visits.append(
                 Visit(
-                    start=session[0].timestamp,
+                    start=visit_start,
                     login=login,
                     route=route,
                     board=board,
@@ -372,7 +369,36 @@ def build_visits(records: Iterable[Record]) -> list[Visit]:
     return visits
 
 
-def write_report(visits: Sequence[Visit], output_path: Path) -> None:
+def build_daily_report_rows(visits: Iterable[Visit]) -> list[DailyReportRow]:
+    """Combine every visit of one inspector/route/board into one daily row."""
+    grouped_visits: dict[tuple[date, str, str, str], list[Visit]] = defaultdict(list)
+    for visit in visits:
+        key = (visit.start.date(), visit.login, visit.route, visit.board)
+        grouped_visits[key].append(visit)
+
+    report_rows = [
+        DailyReportRow(
+            day=day,
+            login=login,
+            route=route,
+            board=board,
+            check_count=sum(visit.check_count for visit in daily_visits),
+            vehicle_check_count=len(daily_visits),
+        )
+        for (day, login, route, board), daily_visits in grouped_visits.items()
+    ]
+    report_rows.sort(
+        key=lambda row: (
+            row.day,
+            row.login.casefold(),
+            row.route.casefold(),
+            row.board.casefold(),
+        )
+    )
+    return report_rows
+
+
+def write_report(report_rows: Sequence[DailyReportRow], output_path: Path) -> None:
     """Write a formatted workbook and atomically replace the previous report."""
     workbook = Workbook()
     worksheet = workbook.active
@@ -385,28 +411,26 @@ def write_report(visits: Sequence[Visit], output_path: Path) -> None:
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
 
-    for visit in visits:
+    for report_row in report_rows:
         worksheet.append(
             (
-                visit.start.date(),
-                visit.start.time(),
-                visit.login,
-                visit.route,
-                visit.board,
-                visit.check_count,
-                visit.visit_total,
+                report_row.day,
+                report_row.login,
+                report_row.route,
+                report_row.board,
+                report_row.check_count,
+                report_row.vehicle_check_count,
             )
         )
 
     for row_number in range(2, worksheet.max_row + 1):
         worksheet.cell(row_number, 1).number_format = "yyyy-mm-dd"
-        worksheet.cell(row_number, 2).number_format = "hh:mm:ss.000"
+        worksheet.cell(row_number, 3).number_format = "@"
         worksheet.cell(row_number, 4).number_format = "@"
-        worksheet.cell(row_number, 5).number_format = "@"
 
     worksheet.freeze_panes = "A2"
-    worksheet.auto_filter.ref = f"A1:G{worksheet.max_row}"
-    column_widths = (13, 27, 20, 18, 18, 20, 16)
+    worksheet.auto_filter.ref = f"A1:F{worksheet.max_row}"
+    column_widths = (13, 20, 18, 18, 20, 21)
     for column_cells, width in zip(worksheet.columns, column_widths):
         worksheet.column_dimensions[column_cells[0].column_letter].width = width
 
@@ -476,7 +500,8 @@ def generate_report(
         raise NoValidDataError("во входных файлах нет валидных строк")
 
     visits = build_visits(all_records)
-    write_report(visits, output_file)
+    report_rows = build_daily_report_rows(visits)
+    write_report(report_rows, output_file)
 
     return ProcessingSummary(
         input_files=len(input_files),
