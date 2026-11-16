@@ -93,6 +93,7 @@ class Visit:
     check_count: int
     visit_number: int
     visit_total: int
+    counted_records: tuple[Record, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -106,6 +107,22 @@ class DailyReportRow:
 
 
 @dataclass(frozen=True, slots=True)
+class InspectorDay:
+    day: date
+    login: str
+    check_count: int
+    vehicle_check_count: int
+    counted_records: tuple[Record, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ReportSections:
+    main_rows: tuple[DailyReportRow, ...]
+    low_visits: tuple[Visit, ...]
+    low_days: tuple[InspectorDay, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class ProcessingSummary:
     input_files: int
     processed_files: int
@@ -114,6 +131,12 @@ class ProcessingSummary:
     skipped_rows: int
     visits: int
     checks: int
+    main_visits: int = 0
+    main_checks: int = 0
+    low_visits: int = 0
+    low_checks: int = 0
+    low_days: int = 0
+    low_day_checks: int = 0
 
 
 WarningHandler = Callable[[str], None]
@@ -302,37 +325,51 @@ def read_records(
         workbook.close()
 
 
-def count_passenger_checks(records: Sequence[Record]) -> int:
-    """Count passenger checks inside one vehicle visit."""
-    if not records:
-        return 0
-
-    # Every non-zero identifier is counted once for this source vehicle visit,
-    # regardless of the timestamps or products of its repeated rows.
-    ticket_ids: set[str] = set()
-    social_card_seconds: set[datetime] = set()
-    zero_ticket_seconds: list[datetime] = []
-
-    for record in records:
-        second = record.timestamp.replace(microsecond=0)
-        if record.ticket_id == ZERO_TICKET_ID:
-            zero_ticket_seconds.append(second)
-            continue
-
-        ticket_ids.add(record.ticket_id)
-        if " ".join(record.ticket_type.split()).casefold() == SOCIAL_CARD_TYPE:
-            social_card_seconds.add(second)
-
-    # Zero identifiers normally represent separate transactions. They are
-    # artifacts of a social-card scan only when a non-zero social-card record
-    # exists on the same vehicle in the same second.
-    return len(ticket_ids) + sum(
-        second not in social_card_seconds for second in zero_ticket_seconds
+def _record_sort_key(record: Record) -> tuple:
+    return (
+        record.timestamp,
+        record.source_name.casefold(),
+        record.source_name,
+        record.source_row,
+        record.visit_start,
+        record.login.casefold(),
+        record.login,
+        record.route.casefold(),
+        record.route,
+        record.board.casefold(),
+        record.board,
+        record.ticket_id,
+        record.ticket_type,
     )
 
 
+def _counted_passenger_records(records: Sequence[Record]) -> list[Record]:
+    """Apply the existing social/zero rules before cross-visit deduplication."""
+    social_card_seconds = {
+        record.timestamp.replace(microsecond=0)
+        for record in records
+        if record.ticket_id != ZERO_TICKET_ID
+        and " ".join(record.ticket_type.split()).casefold() == SOCIAL_CARD_TYPE
+    }
+    selected: list[Record] = []
+    ticket_ids: set[str] = set()
+    for record in sorted(records, key=_record_sort_key):
+        if record.ticket_id == ZERO_TICKET_ID:
+            if record.timestamp.replace(microsecond=0) not in social_card_seconds:
+                selected.append(record)
+        elif record.ticket_id not in ticket_ids:
+            selected.append(record)
+            ticket_ids.add(record.ticket_id)
+    return selected
+
+
+def count_passenger_checks(records: Sequence[Record]) -> int:
+    """Count one visit in isolation; build_visits also deduplicates by day."""
+    return len(_counted_passenger_records(records))
+
+
 def build_visits(records: Iterable[Record]) -> list[Visit]:
-    """Group vehicle visits by their source start, inspector, route, and board."""
+    """Keep source visits; credit tickets once per day/login/route/board."""
     groups: dict[
         tuple[date, str, str, str], dict[datetime, list[Record]]
     ] = defaultdict(lambda: defaultdict(list))
@@ -340,20 +377,43 @@ def build_visits(records: Iterable[Record]) -> list[Visit]:
         key = (record.visit_start.date(), record.login, record.route, record.board)
         groups[key][record.visit_start].append(record)
 
+    candidates: list[Record] = []
+    for starts in groups.values():
+        for session in starts.values():
+            candidates.extend(_counted_passenger_records(session))
+
+    counted_by_visit: dict[
+        tuple[datetime, str, str, str], list[Record]
+    ] = defaultdict(list)
+    daily_tickets: set[tuple[date, str, str, str, str]] = set()
+    for record in sorted(candidates, key=_record_sort_key):
+        if record.ticket_id != ZERO_TICKET_ID:
+            ticket_key = (
+                record.visit_start.date(), record.login, record.route,
+                record.board, record.ticket_id,
+            )
+            if ticket_key in daily_tickets:
+                continue
+            daily_tickets.add(ticket_key)
+        visit_key = (record.visit_start, record.login, record.route, record.board)
+        counted_by_visit[visit_key].append(record)
+
     visits: list[Visit] = []
     for (_day, login, route, board), starts in groups.items():
         sessions = sorted(starts.items())
         visit_total = len(sessions)
         for visit_number, (visit_start, session) in enumerate(sessions, start=1):
+            counted = tuple(counted_by_visit[(visit_start, login, route, board)])
             visits.append(
                 Visit(
                     start=visit_start,
                     login=login,
                     route=route,
                     board=board,
-                    check_count=count_passenger_checks(session),
+                    check_count=len(counted),
                     visit_number=visit_number,
                     visit_total=visit_total,
+                    counted_records=counted,
                 )
             )
 
@@ -398,19 +458,91 @@ def build_daily_report_rows(visits: Iterable[Visit]) -> list[DailyReportRow]:
     return report_rows
 
 
-def write_report(report_rows: Sequence[DailyReportRow], output_path: Path) -> None:
-    """Write a formatted workbook and atomically replace the previous report."""
-    workbook = Workbook()
-    worksheet = workbook.active
-    worksheet.title = "Проверки"
-    worksheet.append(OUTPUT_HEADERS)
+def build_report_sections(visits: Iterable[Visit]) -> ReportSections:
+    """Exclude visits with at most two checks and days below thirty checks."""
+    visits = list(visits)
+    grouped_days: dict[tuple[date, str], list[Visit]] = defaultdict(list)
+    for visit in visits:
+        grouped_days[(visit.start.date(), visit.login)].append(visit)
 
+    low_day_keys: set[tuple[date, str]] = set()
+    low_days: list[InspectorDay] = []
+    for (day, login), day_visits in grouped_days.items():
+        check_count = sum(visit.check_count for visit in day_visits)
+        if check_count < 30:
+            low_day_keys.add((day, login))
+            counted = sorted(
+                (
+                    record for visit in day_visits
+                    for record in visit.counted_records
+                ),
+                key=_record_sort_key,
+            )
+            low_days.append(
+                InspectorDay(day, login, check_count, len(day_visits), tuple(counted))
+            )
+    low_days.sort(key=lambda item: (item.day, item.login.casefold(), item.login))
+
+    low_visits = tuple(
+        sorted(
+            (visit for visit in visits if visit.check_count <= 2),
+            key=lambda visit: (
+                visit.start, visit.login.casefold(), visit.route.casefold(),
+                visit.board.casefold(), visit.login, visit.route, visit.board,
+            ),
+        )
+    )
+    eligible = [
+        visit for visit in visits
+        if visit.check_count > 2
+        and (visit.start.date(), visit.login) not in low_day_keys
+    ]
+    return ReportSections(
+        main_rows=tuple(build_daily_report_rows(eligible)),
+        low_visits=low_visits,
+        low_days=tuple(low_days),
+    )
+
+
+def _format_report_sheet(
+    worksheet,
+    widths: Sequence[int],
+    *,
+    datetime_columns: Sequence[int] = (),
+    text_columns: Sequence[int] = (2, 3, 4),
+) -> None:
     header_fill = PatternFill(fill_type="solid", fgColor="1F4E78")
     for cell in worksheet[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = header_fill
         cell.alignment = Alignment(horizontal="center", vertical="center")
+    for row in worksheet.iter_rows(min_row=2):
+        row[0].number_format = "yyyy-mm-dd"
+        for column in datetime_columns:
+            row[column - 1].number_format = "yyyy-mm-dd hh:mm:ss.000"
+        for column in text_columns:
+            cell = row[column - 1]
+            cell.number_format = "@"
+            if isinstance(cell.value, str):
+                cell.data_type = "s"
+    worksheet.freeze_panes = "A2"
+    worksheet.auto_filter.ref = worksheet.dimensions
+    for column_cells, width in zip(worksheet.columns, widths):
+        worksheet.column_dimensions[column_cells[0].column_letter].width = width
 
+
+def write_report(
+    report_rows: Sequence[DailyReportRow],
+    output_path: Path,
+    *,
+    low_visits: Sequence[Visit] = (),
+    low_days: Sequence[InspectorDay] = (),
+) -> None:
+    """Write the main and both exclusion sheets, replacing only on success."""
+    workbook = Workbook()
+    worksheet = workbook.active
+    worksheet.title = "Проверки"
+    worksheet.append(OUTPUT_HEADERS)
     for report_row in report_rows:
         worksheet.append(
             (
@@ -422,17 +554,69 @@ def write_report(report_rows: Sequence[DailyReportRow], output_path: Path) -> No
                 report_row.vehicle_check_count,
             )
         )
+    _format_report_sheet(worksheet, (13, 20, 18, 18, 20, 21))
 
-    for row_number in range(2, worksheet.max_row + 1):
-        worksheet.cell(row_number, 1).number_format = "yyyy-mm-dd"
-        worksheet.cell(row_number, 3).number_format = "@"
-        worksheet.cell(row_number, 4).number_format = "@"
+    low_sheet = workbook.create_sheet(">=2")
+    low_sheet.append((*OUTPUT_HEADERS, VISIT_START))
+    for visit in low_visits:
+        low_sheet.append(
+            (
+                visit.start.date(),
+                visit.login,
+                visit.route,
+                visit.board,
+                visit.check_count,
+                1,
+                visit.start,
+            )
+        )
+    _format_report_sheet(
+        low_sheet, (13, 20, 18, 18, 20, 21, 27), datetime_columns=(7,)
+    )
 
-    worksheet.freeze_panes = "A2"
-    worksheet.auto_filter.ref = f"A1:F{worksheet.max_row}"
-    column_widths = (13, 20, 18, 18, 20, 21)
-    for column_cells, width in zip(worksheet.columns, column_widths):
-        worksheet.column_dimensions[column_cells[0].column_letter].width = width
+    low_day_sheet = workbook.create_sheet(">30")
+    low_day_sheet.append(
+        (*OUTPUT_HEADERS, CREATED_AT, VISIT_START, TICKET_ID, TICKET_TYPE)
+    )
+    day_blocks: list[tuple[int, int]] = []
+    for inspector_day in low_days:
+        first_row = low_day_sheet.max_row + 1
+        # A zero-check day still needs a row for its date, login and totals.
+        for index, record in enumerate(inspector_day.counted_records or (None,)):
+            low_day_sheet.append(
+                (
+                    inspector_day.day if index == 0 else None,
+                    inspector_day.login if index == 0 else None,
+                    record.route if record is not None else None,
+                    record.board if record is not None else None,
+                    inspector_day.check_count if index == 0 else None,
+                    inspector_day.vehicle_check_count if index == 0 else None,
+                    record.timestamp if record is not None else None,
+                    record.visit_start if record is not None else None,
+                    record.ticket_id if record is not None else None,
+                    record.ticket_type if record is not None else None,
+                )
+            )
+        day_blocks.append((first_row, low_day_sheet.max_row))
+    _format_report_sheet(
+        low_day_sheet,
+        (13, 20, 18, 18, 20, 21, 27, 27, 27, 32),
+        datetime_columns=(7, 8),
+        text_columns=(2, 3, 4, 9, 10),
+    )
+    for row in low_day_sheet.iter_rows(min_row=2):
+        for cell in row:
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+    for first_row, last_row in day_blocks:
+        if first_row < last_row:
+            # Route/board stay alongside each card, including when they change.
+            for column in (1, 2, 5, 6):
+                low_day_sheet.merge_cells(
+                    start_row=first_row,
+                    end_row=last_row,
+                    start_column=column,
+                    end_column=column,
+                )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     temporary_path: Path | None = None
@@ -500,8 +684,11 @@ def generate_report(
         raise NoValidDataError("во входных файлах нет валидных строк")
 
     visits = build_visits(all_records)
-    report_rows = build_daily_report_rows(visits)
-    write_report(report_rows, output_file)
+    sections = build_report_sections(visits)
+    write_report(
+        sections.main_rows, output_file,
+        low_visits=sections.low_visits, low_days=sections.low_days,
+    )
 
     return ProcessingSummary(
         input_files=len(input_files),
@@ -511,6 +698,12 @@ def generate_report(
         skipped_rows=skipped_rows,
         visits=len(visits),
         checks=sum(visit.check_count for visit in visits),
+        main_visits=sum(row.vehicle_check_count for row in sections.main_rows),
+        main_checks=sum(row.check_count for row in sections.main_rows),
+        low_visits=len(sections.low_visits),
+        low_checks=sum(visit.check_count for visit in sections.low_visits),
+        low_days=len(sections.low_days),
+        low_day_checks=sum(day.check_count for day in sections.low_days),
     )
 
 
@@ -526,8 +719,11 @@ def main() -> int:
     print(f"Пропущено файлов: {summary.skipped_files}")
     print(f"Валидных строк: {summary.valid_rows}")
     print(f"Пропущено строк: {summary.skipped_rows}")
-    print(f"Проверок ТС: {summary.visits}")
-    print(f"Проверок пассажиров: {summary.checks}")
+    print(f"Проверок ТС до исключений: {summary.visits}")
+    print(f"Проверок пассажиров после дневного объединения: {summary.checks}")
+    print(f"Проверки: {summary.main_visits} ТС, {summary.main_checks} пассажирских проверок")
+    print(f">=2: {summary.low_visits} ТС с 0, 1 или 2 пассажирскими проверками")
+    print(f">30: {summary.low_days} дней инспекторов с менее чем 30 проверками")
     print(f"Отчёт сохранён: {OUTPUT_FILE}")
     return 0
 
